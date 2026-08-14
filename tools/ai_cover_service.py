@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import hashlib
 import hmac
 import json
 import logging
@@ -39,6 +40,14 @@ RMVPE_ROOT = PROJECT_ROOT / "assets" / "rmvpe"
 JOB_ROOT = Path(
     os.getenv("AI_COVER_JOB_ROOT", str(PROJECT_ROOT / "TEMP" / "ai_cover"))
 ).resolve()
+CACHE_ROOT = Path(
+    os.getenv(
+        "AI_COVER_CACHE_ROOT",
+        str(PROJECT_ROOT / "TEMP" / "ai_cover_cache"),
+    )
+).resolve()
+CACHE_LAYOUT_VERSION = "separation-v1"
+CACHE_ENTRY_ROOT = CACHE_ROOT / CACHE_LAYOUT_VERSION
 FFMPEG = PROJECT_ROOT / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
 FFPROBE = PROJECT_ROOT / ("ffprobe.exe" if os.name == "nt" else "ffprobe")
 
@@ -68,7 +77,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ai_cover_service")
 
-app = FastAPI(title="RVC AI Cover Service", version="1.0.0")
+app = FastAPI(title="RVC AI Cover Service", version="1.1.0")
 job_lock = asyncio.Lock()
 
 
@@ -218,6 +227,126 @@ def _separate(
     return desired, secondary
 
 
+def _cache_entry(audio_hash: str) -> Path:
+    return CACHE_ENTRY_ROOT / audio_hash
+
+
+def _cached_stems(audio_hash: str) -> tuple[Path, Path] | None:
+    """Return a complete cached dry-vocal/instrumental pair, if available."""
+    entry = _cache_entry(audio_hash)
+    vocal = entry / "vocals.wav"
+    instrumental = entry / "instrumental.wav"
+    manifest = entry / "manifest.json"
+    try:
+        metadata = json.loads(manifest.read_text(encoding="utf-8"))
+        if metadata != {
+            "layout": CACHE_LAYOUT_VERSION,
+            "source_sha256": audio_hash,
+        }:
+            return None
+        if vocal.stat().st_size <= 0 or instrumental.stat().st_size <= 0:
+            return None
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    return vocal, instrumental
+
+
+def _restore_cached_stems(
+    audio_hash: str,
+    job_dir: Path,
+) -> tuple[Path, Path] | None:
+    cached = _cached_stems(audio_hash)
+    if not cached:
+        return None
+    destination = job_dir / "cached_stems"
+    destination.mkdir(parents=True, exist_ok=True)
+    vocal = destination / "vocals.wav"
+    instrumental = destination / "instrumental.wav"
+    try:
+        shutil.copyfile(cached[0], vocal)
+        shutil.copyfile(cached[1], instrumental)
+        os.utime(_cache_entry(audio_hash), None)
+    except OSError:
+        logger.warning(
+            "Could not restore separation cache %s", audio_hash, exc_info=True
+        )
+        shutil.rmtree(destination, ignore_errors=True)
+        return None
+    logger.info("Separation cache hit: %s", audio_hash)
+    return vocal, instrumental
+
+
+def _store_cached_stems(
+    audio_hash: str,
+    vocal: Path,
+    instrumental: Path,
+) -> None:
+    """Publish a cache entry only after both stem copies are complete."""
+    CACHE_ENTRY_ROOT.mkdir(parents=True, exist_ok=True)
+    target = _cache_entry(audio_hash)
+    temporary = CACHE_ENTRY_ROOT / f".tmp-{audio_hash}-{uuid.uuid4().hex}"
+    try:
+        temporary.mkdir()
+        shutil.copyfile(vocal, temporary / "vocals.wav")
+        shutil.copyfile(instrumental, temporary / "instrumental.wav")
+        (temporary / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "layout": CACHE_LAYOUT_VERSION,
+                    "source_sha256": audio_hash,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+        temporary.replace(target)
+        logger.info("Separation cache stored: %s", audio_hash)
+    except OSError:
+        logger.warning("Could not store separation cache %s", audio_hash, exc_info=True)
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+
+
+def _cache_stats() -> dict[str, int]:
+    entries = 0
+    total_bytes = 0
+    if not CACHE_ENTRY_ROOT.is_dir():
+        return {"entries": entries, "bytes": total_bytes}
+    for entry in CACHE_ENTRY_ROOT.iterdir():
+        if not entry.is_dir() or _cached_stems(entry.name) is None:
+            continue
+        entries += 1
+        try:
+            total_bytes += sum(
+                path.stat().st_size for path in entry.iterdir() if path.is_file()
+            )
+        except OSError:
+            continue
+    return {"entries": entries, "bytes": total_bytes}
+
+
+def _clear_cache() -> dict[str, int]:
+    """Delete only recognized cache entries below our versioned directory."""
+    before = _cache_stats()
+    if CACHE_ENTRY_ROOT.is_dir():
+        for entry in CACHE_ENTRY_ROOT.iterdir():
+            is_hash_entry = (
+                entry.is_dir()
+                and len(entry.name) == 64
+                and all(character in "0123456789abcdef" for character in entry.name)
+            )
+            if is_hash_entry or entry.name.startswith(".tmp-"):
+                shutil.rmtree(entry, ignore_errors=True)
+    logger.info(
+        "Separation cache cleared: entries=%d bytes=%d",
+        before["entries"],
+        before["bytes"],
+    )
+    return before
+
+
 def _convert_vocal(
     source: Path,
     target: Path,
@@ -323,6 +452,7 @@ def _mix(
 def run_cover_pipeline(
     job_dir: Path,
     uploaded: Path,
+    audio_hash: str,
     model_name: str,
     transpose: int,
     index_rate: float,
@@ -332,21 +462,26 @@ def run_cover_pipeline(
     instrumental_gain: float,
 ) -> tuple[Path, dict[str, object]]:
     model = _resolve_model(model_name)
-    normalized = job_dir / "input.wav"
-    _normalize_audio(uploaded, normalized)
-
-    vocal, instrumental = _separate(
-        normalized,
-        "去伴奏",
-        job_dir / "vocals",
-        job_dir / "instrumental",
-    )
-    dry_vocal, _reverb = _separate(
-        vocal,
-        "去混响",
-        job_dir / "dry_vocal",
-        job_dir / "reverb",
-    )
+    cached = _restore_cached_stems(audio_hash, job_dir)
+    cache_hit = cached is not None
+    if cached:
+        dry_vocal, instrumental = cached
+    else:
+        normalized = job_dir / "input.wav"
+        _normalize_audio(uploaded, normalized)
+        vocal, instrumental = _separate(
+            normalized,
+            "去伴奏",
+            job_dir / "vocals",
+            job_dir / "instrumental",
+        )
+        dry_vocal, _reverb = _separate(
+            vocal,
+            "去混响",
+            job_dir / "dry_vocal",
+            job_dir / "reverb",
+        )
+        _store_cached_stems(audio_hash, dry_vocal, instrumental)
 
     converted = job_dir / "converted_vocal.wav"
     index = _convert_vocal(
@@ -364,11 +499,13 @@ def run_cover_pipeline(
         "model": model.stem,
         "index": index.name if index else None,
         "transpose": transpose,
+        "cache_hit": cache_hit,
     }
 
 
-async def _save_upload(upload: UploadFile, destination: Path) -> int:
+async def _save_upload(upload: UploadFile, destination: Path) -> tuple[int, str]:
     total = 0
+    digest = hashlib.sha256()
     with destination.open("wb") as output:
         while chunk := await upload.read(1024 * 1024):
             total += len(chunk)
@@ -377,9 +514,10 @@ async def _save_upload(upload: UploadFile, destination: Path) -> int:
                     f"upload exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MiB"
                 )
             output.write(chunk)
+            digest.update(chunk)
     if total == 0:
         raise ValueError("uploaded file is empty")
-    return total
+    return total, digest.hexdigest()
 
 
 @app.get("/health")
@@ -387,11 +525,13 @@ async def health(
     x_ai_cover_token: Annotated[str | None, Header()] = None,
 ) -> dict[str, object]:
     _auth(x_ai_cover_token)
+    cache = await asyncio.to_thread(_cache_stats)
     return {
         "ok": True,
         "busy": job_lock.locked(),
         "models": len(_model_files()),
         "max_audio_seconds": MAX_AUDIO_SECONDS,
+        "cache": cache,
     }
 
 
@@ -401,6 +541,24 @@ async def models(
 ) -> dict[str, object]:
     _auth(x_ai_cover_token)
     return {"models": list_models()}
+
+
+@app.get("/cache")
+async def cache_status(
+    x_ai_cover_token: Annotated[str | None, Header()] = None,
+) -> dict[str, object]:
+    _auth(x_ai_cover_token)
+    return {"cache": await asyncio.to_thread(_cache_stats)}
+
+
+@app.delete("/cache")
+async def clear_cache(
+    x_ai_cover_token: Annotated[str | None, Header()] = None,
+) -> dict[str, object]:
+    _auth(x_ai_cover_token)
+    async with job_lock:
+        removed = await asyncio.to_thread(_clear_cache)
+    return {"ok": True, "removed": removed, "cache": _cache_stats()}
 
 
 @app.post("/cover")
@@ -447,7 +605,7 @@ async def cover(
     uploaded = job_dir / f"upload{suffix}"
 
     try:
-        await _save_upload(audio, uploaded)
+        _size, audio_hash = await _save_upload(audio, uploaded)
         duration = await asyncio.to_thread(_probe_audio, uploaded)
         logger.info(
             "Queued AI cover: file=%s duration=%.1fs model=%s",
@@ -460,6 +618,7 @@ async def cover(
                 run_cover_pipeline,
                 job_dir,
                 uploaded,
+                audio_hash,
                 model,
                 transpose,
                 index_rate,
@@ -472,6 +631,7 @@ async def cover(
             "X-AI-Cover-Model": quote(str(metadata["model"]), safe=""),
             "X-AI-Cover-Index": quote(str(metadata["index"] or ""), safe=""),
             "X-AI-Cover-Transpose": str(metadata["transpose"]),
+            "X-AI-Cover-Cache": "hit" if metadata["cache_hit"] else "miss",
         }
         return FileResponse(
             result,
@@ -499,4 +659,5 @@ if __name__ == "__main__":
     import uvicorn
 
     JOB_ROOT.mkdir(parents=True, exist_ok=True)
+    CACHE_ENTRY_ROOT.mkdir(parents=True, exist_ok=True)
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")

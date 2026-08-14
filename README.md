@@ -1,3 +1,159 @@
+# RVC AI Cover Service
+
+这是一个面向 [AstrBot AI 翻唱插件](https://github.com/tignioj/astrbot_plugin_ai_cover) 的 RVC 后端服务。它在 RVC WebUI 的基础上增加了 FastAPI 接口，依次完成人声/伴奏分离、去混响、RVC 音色转换和 MP3 混音。
+
+主要特性：
+
+- 提供 `/health`、`/models`、`/cover` 和 `/cache` 接口；
+- 通过 PyMSS/MSST 完成人声分离和去混响；
+- 自动匹配 RVC `.pth` 模型和对应的 `.index`；
+- 按原始音频 SHA-256 缓存干人声与伴奏，重复翻唱可跳过分离步骤；
+- GPU 任务串行执行，避免多个模型同时争抢显存；
+- 支持共享令牌、上传大小和音频时长限制。
+
+> 本仓库基于 [RVC-Project/Retrieval-based-Voice-Conversion-WebUI](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI) 开发，保留其 MIT 许可证及相关第三方许可证。模型权重、索引、FFmpeg、运行时和生成音频不包含在 Git 仓库中。
+
+## 快速开始
+
+### 1. 准备模型与运行环境
+
+按照后文的[环境配置](#环境配置)和[模型与运行目录](#模型与运行目录)安装依赖并下载基础模型。AI 翻唱至少需要：
+
+```text
+assets/hubert_base/pytorch_model.bin
+assets/rmvpe/rmvpe.pt
+assets/pymss_weights/              # 去伴奏、去混响模型
+assets/weights/角色名.pth          # RVC 音色模型
+logs/**/角色名相关文件.index        # 可选，RVC 特征索引
+```
+
+Windows 整合包还需要在项目根目录提供 `ffmpeg.exe` 和 `ffprobe.exe`。
+
+### 2. 启动 AI 翻唱服务
+
+Windows 整合包可直接运行：
+
+```bat
+start-ai-cover-service.bat
+```
+
+也可以手动启动：
+
+```powershell
+runtime\python.exe tools\ai_cover_service.py
+```
+
+默认监听 `0.0.0.0:18888`。服务暴露到局域网时，建议先设置一个随机共享令牌，并在防火墙中只允许 AstrBot 所在主机访问：
+
+```powershell
+$env:AI_COVER_API_TOKEN = "请替换为随机长字符串"
+runtime\python.exe tools\ai_cover_service.py
+```
+
+可用环境变量：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `AI_COVER_HOST` | `0.0.0.0` | 监听地址 |
+| `AI_COVER_PORT` | `18888` | 监听端口 |
+| `AI_COVER_API_TOKEN` | 空 | `X-AI-Cover-Token` 共享令牌；空值表示不鉴权 |
+| `AI_COVER_MAX_UPLOAD_MB` | `200` | 最大上传大小，MiB |
+| `AI_COVER_MAX_AUDIO_SECONDS` | `900` | 最大音频时长，秒 |
+| `AI_COVER_JOB_ROOT` | `TEMP/ai_cover` | 临时任务目录 |
+| `AI_COVER_CACHE_ROOT` | `TEMP/ai_cover_cache` | 分离缓存目录 |
+| `AI_COVER_LOG_LEVEL` | `INFO` | 日志级别 |
+
+检查服务：
+
+```powershell
+$headers = @{ "X-AI-Cover-Token" = "请替换为上面设置的令牌" }
+Invoke-RestMethod http://127.0.0.1:18888/health -Headers $headers
+Invoke-RestMethod http://127.0.0.1:18888/models -Headers $headers
+```
+
+未设置 `AI_COVER_API_TOKEN` 时可以省略 `-Headers $headers`。
+
+## 配合 AstrBot 插件使用
+
+### 1. 安装插件
+
+插件仓库：<https://github.com/tignioj/astrbot_plugin_ai_cover>
+
+在 AstrBot WebUI 的插件管理页面安装该仓库，或者克隆到 AstrBot 的插件目录：
+
+```bash
+cd data/plugins
+git clone https://github.com/tignioj/astrbot_plugin_ai_cover.git
+```
+
+安装后重启 AstrBot，或在插件管理页面重载插件。
+
+### 2. 配置连接
+
+在插件配置页填写：
+
+- `service_url`：AstrBot 能够访问的服务地址，例如 `http://192.168.1.20:18888`；
+- `api_token`：与 RVC 主机上的 `AI_COVER_API_TOKEN` 完全一致；
+- `timeout_seconds`：单次任务超时，默认 3600 秒；
+- 其余参数可保留默认值，再按效果调整。
+
+如果 AstrBot 运行在 Docker 中，`127.0.0.1` 指向的是 AstrBot 容器自身，不能用来访问另一台 Windows 主机；请填写 Windows RVC 主机的局域网 IP。
+
+### 3. 使用命令
+
+翻唱命令需要在同一条消息中附带音频，或回复一条已有音频：
+
+```text
+/翻唱模型
+/翻唱 珊瑚宫心海
+/翻唱 珊瑚宫心海 0
+/翻唱 珊瑚宫心海 0 1.3
+/翻唱 珊瑚宫心海 0 1.3 0.8
+/翻唱状态
+```
+
+完整格式：
+
+```text
+/翻唱 模型 [升降调] [人声音量] [伴奏音量]
+```
+
+| 参数 | 范围 | 默认行为 |
+| --- | --- | --- |
+| 模型 | `/翻唱模型` 返回的名称 | 必填 |
+| 升降调 | `-24`～`24` 的整数 | `0` |
+| 人声音量 | `0`～`2` | 使用插件配置，`1` 为原音量 |
+| 伴奏音量 | `0`～`2` | 使用插件配置，`1` 为原音量 |
+
+音量为 `0` 表示静音。直接调用后端 API 时音量上限为 `3`，AstrBot 插件为便于日常使用将命令和配置范围限制为 `0`～`2`。
+
+## 分离缓存
+
+服务使用上传文件原始字节的 SHA-256 作为缓存键。相同文件再次翻唱时会复用干人声和伴奏，与模型、升降调和文件名无关。
+
+```text
+GET    /cache   查看缓存条目数和占用空间
+DELETE /cache   清空已识别的分离缓存
+```
+
+AstrBot 插件详情页也提供“分离缓存”管理页面。删除缓存会等待当前 GPU 任务结束，不会删除正在使用的音轨。
+
+## HTTP API
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/health` | 服务状态、模型数量和缓存统计 |
+| `GET` | `/models` | RVC 模型与索引状态 |
+| `POST` | `/cover` | 上传音频并生成 MP3 |
+| `GET` | `/cache` | 查看分离缓存 |
+| `DELETE` | `/cache` | 清空分离缓存 |
+
+`POST /cover` 使用 `multipart/form-data`，必填字段为 `audio` 和 `model`。可选字段为 `transpose`、`index_rate`、`rms_mix_rate`、`protect`、`vocal_gain` 和 `instrumental_gain`。启用令牌后，所有接口都需要请求头 `X-AI-Cover-Token`。
+
+---
+
+## 上游 RVC 使用说明
+
 <div align="center">
 
 <h1>Retrieval-based-Voice-Conversion-WebUI</h1>
