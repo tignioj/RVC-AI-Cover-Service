@@ -1,0 +1,54 @@
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local Python environments
+.venv/
+venv/
+env/
+
+# Secrets and local environment overrides
+.env
+.env.*
+!.env.example
+
+# Editors and operating-system metadata
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Bundled runtime and third-party executables
+/runtime/
+/ffmpeg.exe
+/ffprobe.exe
+
+# Generated audio, caches, training runs, and user models
+/TEMP/
+/opt/
+/logs/
+/configs/config.json
+
+# Downloaded/generated model weights and search indices
+/assets/**/*.pth
+/assets/**/*.pt
+/assets/**/*.ckpt
+/assets/**/*.onnx
+/assets/**/*.bin
+/assets/**/*.index
+
+# Common local logs and temporary files
+*.log
+*.tmp
+*.temp
+
