@@ -5,7 +5,7 @@ The service deliberately keeps the GPU-heavy pipeline in the RVC workspace:
 1. separate vocals and instrumental with the bundled PyMSS model;
 2. remove reverb from the vocal stem;
 3. convert the dry vocal with an RVC model and its matching index;
-4. mix the converted vocal back with the instrumental.
+4. mix the converted vocal back with the instrumental and optionally change speed.
 
 Run with ``runtime\\python.exe tools\\ai_cover_service.py``. AstrBot only needs
 HTTP access to this process; it does not need RVC or CUDA in its container.
@@ -59,6 +59,8 @@ PORT = int(os.getenv("AI_COVER_PORT", "18888"))
 API_TOKEN = os.getenv("AI_COVER_API_TOKEN", "")
 MAX_UPLOAD_BYTES = int(os.getenv("AI_COVER_MAX_UPLOAD_MB", "200")) * 1024 * 1024
 MAX_AUDIO_SECONDS = float(os.getenv("AI_COVER_MAX_AUDIO_SECONDS", "900"))
+MIN_SPEED = 0.5
+MAX_SPEED = 2.0
 
 # The RVC modules read these variables when imported.  Use absolute paths so
 # the service also works when launched outside the repository directory.
@@ -80,7 +82,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ai_cover_service")
 
-app = FastAPI(title="RVC AI Cover Service", version="1.3.0")
+app = FastAPI(title="RVC AI Cover Service", version="1.4.0")
 job_lock = asyncio.Lock()
 
 
@@ -573,14 +575,20 @@ def _mix(
     instrumental_transpose: int,
     vocal_gain: float,
     instrumental_gain: float,
+    speed: float,
 ) -> None:
+    output_filters = [
+        "volume=2",
+        *_atempo_filters(speed),
+        "alimiter=limit=0.95:attack=5:release=50",
+    ]
     mix_filter = (
         f"[0:a]{_instrumental_filters(instrumental_transpose, instrumental_gain)}[bg];"
         f"[1:a]volume={vocal_gain:.4f}[voice];"
         # The bundled FFmpeg predates amix's normalize option. Its legacy
         # behavior divides a two-input mix by two, so compensate afterwards.
-        "[bg][voice]amix=inputs=2:duration=longest:dropout_transition=0,volume=2,"
-        "alimiter=limit=0.95:attack=5:release=50[out]"
+        "[bg][voice]amix=inputs=2:duration=longest:dropout_transition=0,"
+        f"{','.join(output_filters)}[out]"
     )
     _run(
         [
@@ -622,6 +630,7 @@ def run_cover_pipeline(
     protect: float,
     vocal_gain: float,
     instrumental_gain: float,
+    speed: float,
 ) -> tuple[Path, dict[str, object]]:
     model = _resolve_model(model_name)
     cached = _restore_cached_stems(audio_hash, job_dir)
@@ -663,12 +672,14 @@ def run_cover_pipeline(
         instrumental_transpose,
         vocal_gain,
         instrumental_gain,
+        speed,
     )
     return result, {
         "model": model.stem,
         "index": index.name if index else None,
         "transpose": transpose,
         "instrumental_transpose": instrumental_transpose,
+        "speed": speed,
         "cache_hit": cache_hit,
     }
 
@@ -762,6 +773,7 @@ async def cover(
     protect: Annotated[float, Form()] = 0.25,
     vocal_gain: Annotated[float, Form()] = 1.0,
     instrumental_gain: Annotated[float, Form()] = 1.0,
+    speed: Annotated[float, Form()] = 1.0,
     x_ai_cover_token: Annotated[str | None, Header()] = None,
 ) -> FileResponse:
     _auth(x_ai_cover_token)
@@ -791,6 +803,11 @@ async def cover(
             raise HTTPException(
                 status_code=422, detail=f"{name} must be between 0 and 3"
             )
+    if not math.isfinite(speed) or not MIN_SPEED <= speed <= MAX_SPEED:
+        raise HTTPException(
+            status_code=422,
+            detail=f"speed must be between {MIN_SPEED:g} and {MAX_SPEED:g}",
+        )
 
     JOB_ROOT.mkdir(parents=True, exist_ok=True)
     job_dir = JOB_ROOT / uuid.uuid4().hex
@@ -805,12 +822,13 @@ async def cover(
         duration = await asyncio.to_thread(_probe_audio, uploaded)
         logger.info(
             "Queued AI cover: file=%s duration=%.1fs model=%s "
-            "vocal_transpose=%s instrumental_transpose=%s",
+            "vocal_transpose=%s instrumental_transpose=%s speed=%s",
             audio.filename,
             duration,
             model,
             transpose,
             instrumental_transpose,
+            speed,
         )
         async with job_lock:
             result, metadata = await asyncio.to_thread(
@@ -827,6 +845,7 @@ async def cover(
                 protect,
                 vocal_gain,
                 instrumental_gain,
+                speed,
             )
         headers = {
             "X-AI-Cover-Model": quote(str(metadata["model"]), safe=""),
@@ -835,6 +854,7 @@ async def cover(
             "X-AI-Cover-Instrumental-Transpose": str(
                 metadata["instrumental_transpose"]
             ),
+            "X-AI-Cover-Speed": str(metadata["speed"]),
             "X-AI-Cover-Cache": "hit" if metadata["cache_hit"] else "miss",
         }
         return FileResponse(
