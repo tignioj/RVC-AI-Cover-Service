@@ -19,16 +19,18 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
 import sys
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import quote
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
@@ -46,8 +48,9 @@ CACHE_ROOT = Path(
         str(PROJECT_ROOT / "TEMP" / "ai_cover_cache"),
     )
 ).resolve()
-CACHE_LAYOUT_VERSION = "separation-v1"
+CACHE_LAYOUT_VERSION = "separation-v2"
 CACHE_ENTRY_ROOT = CACHE_ROOT / CACHE_LAYOUT_VERSION
+LEGACY_CACHE_LAYOUTS = ("separation-v1",)
 FFMPEG = PROJECT_ROOT / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
 FFPROBE = PROJECT_ROOT / ("ffprobe.exe" if os.name == "nt" else "ffprobe")
 
@@ -77,7 +80,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ai_cover_service")
 
-app = FastAPI(title="RVC AI Cover Service", version="1.1.0")
+app = FastAPI(title="RVC AI Cover Service", version="1.3.0")
 job_lock = asyncio.Lock()
 
 
@@ -231,22 +234,57 @@ def _cache_entry(audio_hash: str) -> Path:
     return CACHE_ENTRY_ROOT / audio_hash
 
 
+def _is_audio_hash(value: str) -> bool:
+    return len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value
+    )
+
+
+def _source_filename(value: str | None) -> str:
+    filename = str(value or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
+    return filename[:240] or "未知音频"
+
+
+def _song_name(source_filename: str) -> str:
+    name = Path(source_filename).stem.strip()
+    return name[:200] or "未知歌曲"
+
+
+def _utc_timestamp(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+
+
+def _cache_metadata(audio_hash: str) -> dict[str, str] | None:
+    manifest = _cache_entry(audio_hash) / "manifest.json"
+    try:
+        metadata = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    required = {
+        "layout": CACHE_LAYOUT_VERSION,
+        "source_sha256": audio_hash,
+    }
+    if any(metadata.get(key) != value for key, value in required.items()):
+        return None
+    if not all(
+        isinstance(metadata.get(key), str) and metadata[key].strip()
+        for key in ("song_name", "source_filename", "created_at")
+    ):
+        return None
+    return metadata
+
+
 def _cached_stems(audio_hash: str) -> tuple[Path, Path] | None:
     """Return a complete cached dry-vocal/instrumental pair, if available."""
+    if not _is_audio_hash(audio_hash) or _cache_metadata(audio_hash) is None:
+        return None
     entry = _cache_entry(audio_hash)
     vocal = entry / "vocals.wav"
     instrumental = entry / "instrumental.wav"
-    manifest = entry / "manifest.json"
     try:
-        metadata = json.loads(manifest.read_text(encoding="utf-8"))
-        if metadata != {
-            "layout": CACHE_LAYOUT_VERSION,
-            "source_sha256": audio_hash,
-        }:
-            return None
         if vocal.stat().st_size <= 0 or instrumental.stat().st_size <= 0:
             return None
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except OSError:
         return None
     return vocal, instrumental
 
@@ -280,11 +318,13 @@ def _store_cached_stems(
     audio_hash: str,
     vocal: Path,
     instrumental: Path,
+    source_filename: str,
 ) -> None:
     """Publish a cache entry only after both stem copies are complete."""
     CACHE_ENTRY_ROOT.mkdir(parents=True, exist_ok=True)
     target = _cache_entry(audio_hash)
     temporary = CACHE_ENTRY_ROOT / f".tmp-{audio_hash}-{uuid.uuid4().hex}"
+    normalized_filename = _source_filename(source_filename)
     try:
         temporary.mkdir()
         shutil.copyfile(vocal, temporary / "vocals.wav")
@@ -294,6 +334,9 @@ def _store_cached_stems(
                 {
                     "layout": CACHE_LAYOUT_VERSION,
                     "source_sha256": audio_hash,
+                    "song_name": _song_name(normalized_filename),
+                    "source_filename": normalized_filename,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
                 },
                 ensure_ascii=False,
             ),
@@ -309,22 +352,110 @@ def _store_cached_stems(
         shutil.rmtree(temporary, ignore_errors=True)
 
 
-def _cache_stats() -> dict[str, int]:
-    entries = 0
-    total_bytes = 0
+def _cache_item(audio_hash: str) -> dict[str, object] | None:
+    metadata = _cache_metadata(audio_hash)
+    if metadata is None or _cached_stems(audio_hash) is None:
+        return None
+    entry = _cache_entry(audio_hash)
+    try:
+        total_bytes = sum(
+            path.stat().st_size for path in entry.iterdir() if path.is_file()
+        )
+        last_accessed_at = _utc_timestamp(entry.stat().st_mtime)
+    except OSError:
+        return None
+    return {
+        "id": audio_hash,
+        "song_name": metadata["song_name"],
+        "source_filename": metadata["source_filename"],
+        "bytes": total_bytes,
+        "created_at": metadata["created_at"],
+        "last_accessed_at": last_accessed_at,
+    }
+
+
+def _cache_items(query: str = "") -> list[dict[str, object]]:
+    items: list[dict[str, object]] = []
     if not CACHE_ENTRY_ROOT.is_dir():
-        return {"entries": entries, "bytes": total_bytes}
+        return items
     for entry in CACHE_ENTRY_ROOT.iterdir():
-        if not entry.is_dir() or _cached_stems(entry.name) is None:
+        if not entry.is_dir() or (item := _cache_item(entry.name)) is None:
             continue
-        entries += 1
-        try:
-            total_bytes += sum(
-                path.stat().st_size for path in entry.iterdir() if path.is_file()
-            )
-        except OSError:
+        items.append(item)
+    items.sort(key=lambda item: str(item["last_accessed_at"]), reverse=True)
+    normalized_query = query.strip().casefold()
+    if normalized_query:
+        items = [
+            item
+            for item in items
+            if normalized_query in str(item["song_name"]).casefold()
+            or normalized_query in str(item["source_filename"]).casefold()
+        ]
+    return items
+
+
+def _cache_stats() -> dict[str, int]:
+    items = _cache_items()
+    return {
+        "entries": len(items),
+        "bytes": sum(int(item["bytes"]) for item in items),
+    }
+
+
+def _cache_snapshot(query: str = "") -> dict[str, object]:
+    all_items = _cache_items()
+    normalized_query = query.strip().casefold()
+    items = all_items
+    if normalized_query:
+        items = [
+            item
+            for item in all_items
+            if normalized_query in str(item["song_name"]).casefold()
+            or normalized_query in str(item["source_filename"]).casefold()
+        ]
+    return {
+        "cache": {
+            "entries": len(all_items),
+            "bytes": sum(int(item["bytes"]) for item in all_items),
+        },
+        "items": items,
+    }
+
+
+def _delete_cache_entries(audio_hashes: list[str]) -> dict[str, int]:
+    removed_entries = 0
+    removed_bytes = 0
+    for audio_hash in dict.fromkeys(audio_hashes):
+        item = _cache_item(audio_hash)
+        if item is None:
             continue
-    return {"entries": entries, "bytes": total_bytes}
+        shutil.rmtree(_cache_entry(audio_hash), ignore_errors=True)
+        if not _cache_entry(audio_hash).exists():
+            removed_entries += 1
+            removed_bytes += int(item["bytes"])
+    logger.info(
+        "Separation cache entries removed: entries=%d bytes=%d",
+        removed_entries,
+        removed_bytes,
+    )
+    return {"entries": removed_entries, "bytes": removed_bytes}
+
+
+def _discard_obsolete_cache() -> None:
+    """Remove pre-metadata caches and incomplete v2 entries at service startup."""
+    for layout in LEGACY_CACHE_LAYOUTS:
+        legacy_root = CACHE_ROOT / layout
+        if legacy_root.is_dir():
+            shutil.rmtree(legacy_root, ignore_errors=True)
+            logger.info("Obsolete separation cache removed: %s", legacy_root)
+    if not CACHE_ENTRY_ROOT.is_dir():
+        return
+    for entry in CACHE_ENTRY_ROOT.iterdir():
+        is_incomplete_entry = entry.is_dir() and _is_audio_hash(entry.name)
+        if is_incomplete_entry and _cache_item(entry.name) is None:
+            shutil.rmtree(entry, ignore_errors=True)
+        elif entry.name.startswith(".tmp-"):
+            shutil.rmtree(entry, ignore_errors=True)
 
 
 def _clear_cache() -> dict[str, int]:
@@ -332,11 +463,7 @@ def _clear_cache() -> dict[str, int]:
     before = _cache_stats()
     if CACHE_ENTRY_ROOT.is_dir():
         for entry in CACHE_ENTRY_ROOT.iterdir():
-            is_hash_entry = (
-                entry.is_dir()
-                and len(entry.name) == 64
-                and all(character in "0123456789abcdef" for character in entry.name)
-            )
+            is_hash_entry = entry.is_dir() and _is_audio_hash(entry.name)
             if is_hash_entry or entry.name.startswith(".tmp-"):
                 shutil.rmtree(entry, ignore_errors=True)
     logger.info(
@@ -407,15 +534,46 @@ def _convert_vocal(
             torch.cuda.empty_cache()
 
 
+def _atempo_filters(tempo: float) -> list[str]:
+    """Build an atempo chain compatible with FFmpeg's legacy 0.5-2 range."""
+    filters: list[str] = []
+    while tempo < 0.5:
+        filters.append("atempo=0.5")
+        tempo /= 0.5
+    while tempo > 2.0:
+        filters.append("atempo=2")
+        tempo /= 2.0
+    if not math.isclose(tempo, 1.0, rel_tol=0.0, abs_tol=1e-9):
+        filters.append(f"atempo={tempo:.10f}")
+    return filters
+
+
+def _instrumental_filters(transpose: int, gain: float) -> str:
+    """Pitch-shift the 44.1 kHz instrumental while preserving its duration."""
+    filters: list[str] = []
+    if transpose:
+        pitch_ratio = 2 ** (transpose / 12)
+        filters.extend(
+            [
+                f"asetrate={44100 * pitch_ratio:.10f}",
+                "aresample=44100",
+                *_atempo_filters(1 / pitch_ratio),
+            ]
+        )
+    filters.append(f"volume={gain:.4f}")
+    return ",".join(filters)
+
+
 def _mix(
     instrumental: Path,
     vocal: Path,
     target: Path,
+    instrumental_transpose: int,
     vocal_gain: float,
     instrumental_gain: float,
 ) -> None:
     mix_filter = (
-        f"[0:a]volume={instrumental_gain:.4f}[bg];"
+        f"[0:a]{_instrumental_filters(instrumental_transpose, instrumental_gain)}[bg];"
         f"[1:a]volume={vocal_gain:.4f}[voice];"
         # The bundled FFmpeg predates amix's normalize option. Its legacy
         # behavior divides a two-input mix by two, so compensate afterwards.
@@ -453,8 +611,10 @@ def run_cover_pipeline(
     job_dir: Path,
     uploaded: Path,
     audio_hash: str,
+    source_filename: str,
     model_name: str,
     transpose: int,
+    instrumental_transpose: int,
     index_rate: float,
     rms_mix_rate: float,
     protect: float,
@@ -481,7 +641,7 @@ def run_cover_pipeline(
             job_dir / "dry_vocal",
             job_dir / "reverb",
         )
-        _store_cached_stems(audio_hash, dry_vocal, instrumental)
+        _store_cached_stems(audio_hash, dry_vocal, instrumental, source_filename)
 
     converted = job_dir / "converted_vocal.wav"
     index = _convert_vocal(
@@ -494,11 +654,19 @@ def run_cover_pipeline(
         protect,
     )
     result = job_dir / "ai_cover.mp3"
-    _mix(instrumental, converted, result, vocal_gain, instrumental_gain)
+    _mix(
+        instrumental,
+        converted,
+        result,
+        instrumental_transpose,
+        vocal_gain,
+        instrumental_gain,
+    )
     return result, {
         "model": model.stem,
         "index": index.name if index else None,
         "transpose": transpose,
+        "instrumental_transpose": instrumental_transpose,
         "cache_hit": cache_hit,
     }
 
@@ -518,6 +686,11 @@ async def _save_upload(upload: UploadFile, destination: Path) -> tuple[int, str]
     if total == 0:
         raise ValueError("uploaded file is empty")
     return total, digest.hexdigest()
+
+
+@app.on_event("startup")
+async def discard_obsolete_cache() -> None:
+    await asyncio.to_thread(_discard_obsolete_cache)
 
 
 @app.get("/health")
@@ -545,10 +718,25 @@ async def models(
 
 @app.get("/cache")
 async def cache_status(
+    query: Annotated[str, Query(max_length=200)] = "",
     x_ai_cover_token: Annotated[str | None, Header()] = None,
 ) -> dict[str, object]:
     _auth(x_ai_cover_token)
-    return {"cache": await asyncio.to_thread(_cache_stats)}
+    return await asyncio.to_thread(_cache_snapshot, query)
+
+
+@app.post("/cache/delete")
+async def delete_cache_entries(
+    ids: Annotated[list[str], Body(embed=True, min_length=1, max_length=500)],
+    x_ai_cover_token: Annotated[str | None, Header()] = None,
+) -> dict[str, object]:
+    _auth(x_ai_cover_token)
+    normalized_ids = list(dict.fromkeys(str(item).strip().lower() for item in ids))
+    if any(not _is_audio_hash(item) for item in normalized_ids):
+        raise HTTPException(status_code=422, detail="ids contains an invalid cache ID")
+    async with job_lock:
+        removed = await asyncio.to_thread(_delete_cache_entries, normalized_ids)
+    return {"ok": True, "removed": removed, **_cache_snapshot()}
 
 
 @app.delete("/cache")
@@ -566,6 +754,7 @@ async def cover(
     audio: Annotated[UploadFile, File()],
     model: Annotated[str, Form()],
     transpose: Annotated[int, Form()] = 0,
+    instrumental_transpose: Annotated[int, Form()] = 0,
     index_rate: Annotated[float, Form()] = 0.75,
     rms_mix_rate: Annotated[float, Form()] = 0.25,
     protect: Annotated[float, Form()] = 0.25,
@@ -577,6 +766,11 @@ async def cover(
     if not -24 <= transpose <= 24:
         raise HTTPException(
             status_code=422, detail="transpose must be between -24 and 24"
+        )
+    if not -24 <= instrumental_transpose <= 24:
+        raise HTTPException(
+            status_code=422,
+            detail="instrumental_transpose must be between -24 and 24",
         )
     for name, value in {
         "index_rate": index_rate,
@@ -608,10 +802,13 @@ async def cover(
         _size, audio_hash = await _save_upload(audio, uploaded)
         duration = await asyncio.to_thread(_probe_audio, uploaded)
         logger.info(
-            "Queued AI cover: file=%s duration=%.1fs model=%s",
+            "Queued AI cover: file=%s duration=%.1fs model=%s "
+            "vocal_transpose=%s instrumental_transpose=%s",
             audio.filename,
             duration,
             model,
+            transpose,
+            instrumental_transpose,
         )
         async with job_lock:
             result, metadata = await asyncio.to_thread(
@@ -619,8 +816,10 @@ async def cover(
                 job_dir,
                 uploaded,
                 audio_hash,
+                audio.filename or "未知音频",
                 model,
                 transpose,
+                instrumental_transpose,
                 index_rate,
                 rms_mix_rate,
                 protect,
@@ -631,6 +830,9 @@ async def cover(
             "X-AI-Cover-Model": quote(str(metadata["model"]), safe=""),
             "X-AI-Cover-Index": quote(str(metadata["index"] or ""), safe=""),
             "X-AI-Cover-Transpose": str(metadata["transpose"]),
+            "X-AI-Cover-Instrumental-Transpose": str(
+                metadata["instrumental_transpose"]
+            ),
             "X-AI-Cover-Cache": "hit" if metadata["cache_hit"] else "miss",
         }
         return FileResponse(
