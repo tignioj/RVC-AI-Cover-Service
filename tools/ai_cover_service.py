@@ -28,7 +28,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
@@ -241,7 +241,8 @@ def _is_audio_hash(value: str) -> bool:
 
 
 def _source_filename(value: str | None) -> str:
-    filename = str(value or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
+    decoded = unquote(str(value or ""))
+    filename = decoded.replace("\\", "/").rsplit("/", 1)[-1].strip()
     return filename[:240] or "未知音频"
 
 
@@ -364,10 +365,11 @@ def _cache_item(audio_hash: str) -> dict[str, object] | None:
         last_accessed_at = _utc_timestamp(entry.stat().st_mtime)
     except OSError:
         return None
+    source_filename = _source_filename(metadata["source_filename"])
     return {
         "id": audio_hash,
-        "song_name": metadata["song_name"],
-        "source_filename": metadata["source_filename"],
+        "song_name": _song_name(source_filename),
+        "source_filename": source_filename,
         "bytes": total_bytes,
         "created_at": metadata["created_at"],
         "last_accessed_at": last_accessed_at,
